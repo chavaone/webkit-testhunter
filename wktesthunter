@@ -1,8 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-#  Copyright 2014 Igalia S.L.
+#  Copyright 2014,2015 Igalia S.L.
 #  Carlos Alberto Lopez Perez <clopez@igalia.com>
+#  Marcos Chavarría Teiejeiro <chavarria1991@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,31 +18,26 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-
-# Run with python3 if available (is faster)
-import sys
+      
 import os
-try:
-    if sys.version_info[0] < 3:
-        os.execvp('python3', ['python3', __file__] + sys.argv[1:])
-except:
-    # No python3 :(
-    pass
-
+import urllib
 import re
-import json
 import argparse
+import sys
 import subprocess
-from collections import OrderedDict
-
+from termcolor import cprint
+from wkth import wktesthunter
+                   
 extrahelp = '''
 About the colors:
 
-    - A red color means that the test result and the expectation didn't matched.
+    - A red color means that the test reported a REGRESION error.
+    - A yellow color means that the test reported a FLAKY error.
+    - A blue color means that the test reported a MISSING error.
     - A green color means that the test result was expected.
       - If 'FAIL' is on the expectation, then the test matches the expectation
         if the result is any of 'FAIL', 'TEXT', 'IMAGE+TEXT' or 'AUDIO'.
-    - No color means UNKNOWN (no data)
+    - A white color means UNKNOWN (no data)
 
 
 The meaning of the possible results for a test on a revision is:
@@ -85,212 +81,193 @@ Note for lazy people:
       "--onlyprinterr", "--only" or "--o"; or you can use "--mergeunknown", "--merge" or "--m"
 '''
 
-
-def iprint(firstrev,lastrev,result,startcolor):
-
-    if lastrev == None:
-        startstr=("r%d" %firstrev)
+def get_svn_rev (test):
+    svncmd = ["svn", "log", "-r" ,"1:HEAD", "--limit", "1",
+              "https://svn.webkit.org/repository/webkit/trunk/LayoutTests/" + test ]
+    psvn = subprocess.Popen( svncmd, stdout=subprocess.PIPE,stderr=subprocess.PIPE )
+    (outsvn, errsvn) = psvn.communicate()
+    svnreturncode = psvn.returncode
+    if svnreturncode == 0:
+        svnrev = outsvn.decode('utf8').splitlines()[1].split()[0]
+        return int(re.match("^r([0-9]+)$", svnrev).groups()[0])
     else:
-        startstr=("[r%d-r%d]" %(firstrev,lastrev))
+        return 1
 
-    if startcolor != None:
-        endcolor='\033[0m'
-    else:
-        endcolor=''
-        startcolor=''
+def get_print_color (res):
+    if "report" in res:
+        return {
+            "MISSING": "blue",
+            "REGRESSION": "red",
+            "FLAKY": "yellow",
+            "NOWPASSING": "magenta"
+            }[res["report"]]
+    if res["actual"] == "UNKNOWN":
+        return "white"
+    return "green"
 
-    print('%s%s%s%s%s' %(startcolor,startstr," "*(30-len(startstr)),result,endcolor))
-
-
-
-
-def main(test, debug, detail, mergeunknown, showexpected, usecolor, checksvn):
-    resultsfortests = {}
-    resultsfortests[test]=OrderedDict()
-    testparts=test.split('/')
-    if len(testparts) < 2 or "." not in testparts[len(testparts)-1]:
-        raise ValueError("Test should be in the format path/test.html. Only one test accepted as parameter (no wildcards or directories)")
-    # The order of the bots is relevant. If the same revision has been built for more than one bot,
-    # the last one will take precedence and will be the one that shows on the output.
-    bots=["GTK Linux 64-bit Release", "GTK Linux 64-bit Release WK2 (Tests)", "GTK Linux 64-bit Release (Tests)"]
-
-    outsvn = None
-    errsvn = None
-    svnreturncode = None
-    svnrev = 1
-    if checksvn:
-        try:
-            svncmd = ["svn", "log", "-r" ,"1:HEAD", "--limit", "1",
-                      "https://svn.webkit.org/repository/webkit/trunk/LayoutTests/" + test ]
-            psvn = subprocess.Popen( svncmd, stdout=subprocess.PIPE,stderr=subprocess.PIPE )
-            (outsvn, errsvn) = psvn.communicate()
-            svnreturncode = psvn.returncode
-            if svnreturncode == 0:
-                svnrev = outsvn.decode('utf8').splitlines()[1].split()[0]
-                revregex = re.compile("^r[0-9]+$")
-                if revregex.match(svnrev):
-                    svnrev = int(svnrev[1:])
-                else:
-                    raise
-            else:
-                raise
-        except:
-            print ("Got an exception while trying to check the first revision for the test %s\n" %(test))
-            print ("Tried to run the following command: \"%s\"\n" %" ".join(svncmd))
-            if svnreturncode is None:
-                print ("Check that svn is installed.")
-            else:
-                print ("The return code was %d\n" %svnreturncode)
-                if outsvn is not None:
-                    print ("The standard output was:\n%s\n" %outsvn.decode('utf8'))
-                if errsvn is not None:
-                    print ("The standard error was:\n%s\n" %errsvn.decode('utf8'))
-            print ("Continuing without that information (assuming the first revision was r1)...\n\n")
-
-    if mergeunknown:
-        noerror="NOERROR/UNKNOWN"
-        unknown=noerror
-    else:
-        noerror="NOERROR"
-        unknown="UNKNOWN"
-
-    for bot in bots:
-        botdir=os.path.join('jsonresults',bot)
-        if not os.path.isdir(botdir):
-            print ("WARNING: Skipping bot %s without results fetched" %bot)
-            continue
-        jsonresults=os.listdir(botdir)
-        jsonresults.sort()
-        for jsonresult in jsonresults:
-            if jsonresult.startswith("full_results_") and jsonresult.endswith('.json'):
-                (revision, buildnumber) = jsonresult.split("full_results_")[1].split(".json")[0].split('_')
-                revision=int(revision.strip('r'))
-                buildnumber=int(buildnumber.strip('b'))
-                # Read file
-                json_file=open(os.path.join(botdir, jsonresult))
-                json_data=json_file.read()
-                json_file.close()
-                # Clean it
-                json_data=json_data.split('ADD_RESULTS(')[1]
-                json_data=json_data.split(');')[0]
-                # Parse it
-                try:
-                    json_parsed = json.loads(json_data)
-                except:
-                    if debug: print ("WARNING: Exception caused by file: %s Ignoring file." %os.path.join('jsonresults',bot,jsonresult))
-                    continue
-                # Sanity check
-                if int(json_parsed['revision']) != revision:
-                    if debug: print ("WARNING: Parsed revision %s don't match expected one %d for file %s" %(json_parsed['revision'],revision,jsonresult))
-                    revision=int(json_parsed['revision'])
-
-                if revision in resultsfortests[test]:
-                    if debug: print ("WARNING: Data for revision %d duplicated. Picking last\n" %revision)
-
-                resultsfortests[test][revision]={}
-
-                keytest=json_parsed['tests']
-                try:
-                    for testpart in testparts:
-                        keytest=keytest[testpart]
-                except KeyError:
-                    # This test didn't failed (or wasn't ran) on this rev.
-                    if json_parsed['interrupted']:
-                        # If the whole set of tests didn't finished, mark it as unknown.
-                        if debug: print ("On revision %s the test set didn't finished." %(revision))
-                        resultsfortests[test][revision]['result']=unknown
-                    else:
-                        # Otherwise, mark it as noerror.
-                        resultsfortests[test][revision]['result']=noerror
-                    continue
-
-                resultsfortests[test][revision]['result']=keytest['actual']
-                if 'expected' in keytest:
-                    resultsfortests[test][revision]['expected']=keytest['expected']
-
-    minrev=list(resultsfortests[test].keys())[0]
-    maxrev=list(resultsfortests[test].keys())[len(resultsfortests[test])-1]
-    print ("INFO: The revisions already fetched from the bots are on the interval [r%d-r%d]" %(minrev,maxrev))
-    startrev=max(minrev,svnrev)
-    if startrev > maxrev:
-        print ("The starting revision r%d is great than the last revision with data r%d" %(startrev,maxrev))
-        print ("Please fetch more data before continuing...")
-        return
-    lastprinted=unknown
-    lastrevprinted=svnrev-1
-    if svnrev > 1: print ("INFO: From svn.webkit.org got that r%d added this test." %(svnrev))
-    # trick to end the print the last interval on the loop.
-    resultsfortests[test][maxrev+1]={}
-    resultsfortests[test][maxrev+1]['result']='END'
-    print ("\nResults for test: %s\n" %test)
-    for revision in range(startrev,maxrev+2):
-        if revision in resultsfortests[test]:
-            toprint=resultsfortests[test][revision]['result']
-            if showexpected and 'expected' in resultsfortests[test][revision]:
-                toprint = "%s (Expected: %s)" %(toprint,resultsfortests[test][revision]['expected'])
-        else:
-                toprint=unknown
-        if lastprinted==toprint:
-            continue
-        else:
-            if detail or (lastprinted != unknown and lastprinted != noerror):
-                color=None
-                if usecolor:
-                    # We are going to print. Choose the color
-                    if lastprinted != unknown:
-                        color='\033[0;32m' # green
-                    try:
-                        if 'expected' in resultsfortests[test][revision-1]:
-                            for value in resultsfortests[test][revision-1]['result'].split(" "):
-                                if ( (value not in resultsfortests[test][revision-1]['expected']) and # we check also for "[TEXT|IMAGE+TEXT|AUDIO]==FAIL"
-                                     ( (value not in ('TEXT', 'IMAGE+TEXT', 'AUDIO')) or ('FAIL' not in resultsfortests[test][revision-1]['expected']) ) ):
-                                    color='\033[0;31m' # red
-                                    if debug: print ("INFO: Marking test % as red on rev r%d, because actual value \"%s\" of \"%s\" is not in expected \"%s\" "
-                                        %(test,revision-1,value,resultsfortests[test][revision-1]['result'],resultsfortests[test][revision-1]['expected']))
-                    # This means we are going to print an unknown interval
-                    except KeyError:
-                        pass
-
-                if lastprinted != unknown or not ignoreunknown:
-                    if revision > svnrev:
-                        if revision-lastrevprinted > 2:
-                            iprint (lastrevprinted+1,revision-1,lastprinted,color)
-                        else:
-                            iprint (revision-1,None,lastprinted,color)
-            lastrevprinted=revision-1
-            lastprinted=toprint
-    print("\n")
-    return 0
-
-if __name__ == '__main__':
-
-    parser = argparse.ArgumentParser(epilog=extrahelp, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--debug", help="Print debug messages.", action="store_true")
+def main_hunt(resultsdir, bot):
+    parser = argparse.ArgumentParser(prog="wktesthunter hunt", epilog=extrahelp, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--onlyprinterr", help="Don't print NOERROR or UNKNOWN results.", action="store_true")
     parser.add_argument("--mergeunknown", help="If set, will join the UNKNOWN results (no data for this revision)\n"
-                                               "with the NOERROR results (we have data, but no error/result was reported).\n", action="store_true")
+                                               "with the surrounding results. If the surrounding results have \n"
+                                               "different values it would print UNKNOWN.\n", action="store_true")
     parser.add_argument("--ignoreunknown", help="If set, will not print UNKNOWN (no data for this revision)\n"
                                           "This option disregards --mergeunknown.\n", action="store_true")
     parser.add_argument("--noshowexpected", help="Print only the test results without the expected result.", action="store_true")
     parser.add_argument("--nocolor", help="Don't print colors", action="store_true")
     parser.add_argument("--nochecksvn", help="Don't query svn.webkit.org for the revision that added the test and assume it was r1.", action="store_true")
     parser.add_argument("test_name", type=str, help="Name for the test (as specified on run-webkit-tests).")
-    args = parser.parse_args()
+    cmd_ind = sys.argv.index("hunt")    
+    args = parser.parse_args(sys.argv[cmd_ind + 1:])
 
-    if args.debug: debug = True
-    else: debug = False
-    if args.onlyprinterr: detail = False
-    else: detail = True
-    if args.mergeunknown: mergeunknown = True
-    else: mergeunknown = False
-    if args.ignoreunknown: ignoreunknown = True;
-    else: ignoreunknown = False
-    if args.noshowexpected: showexpected = False
-    else: showexpected = True
-    if args.nocolor: usecolor = False
-    else: usecolor = True
-    if args.nochecksvn: checksvn = False
-    else: checksvn = True
 
-    main(args.test_name, debug, detail, mergeunknown, showexpected, usecolor, checksvn)
+    detail = not bool(args.onlyprinterr)
+    mergeunknown = bool(args.mergeunknown)
+    ignoreunknown = bool(args.ignoreunknown)
+    showexpected = not bool(args.noshowexpected)
+    usecolor = not bool(args.nocolor)
+    checksvn = not bool(args.nochecksvn)
 
+    wkth = wktesthunter.WKTestHunter(resultsdir, bot)
+
+    firstrev = get_svn_rev(args.test_name) if checksvn else 1
+
+    (lastrev, lastbuild) = wkth.get_last_revision()    
+    print("INFO: Last revision fetched: r%i - b%i" % (lastrev, lastbuild))
+
+    if firstrev > 1: print("INFO: From svn.webkit.org got that r%d added this test." %(firstrev))
+
+    try:
+        results = wkth.get_test_results(args.test_name, first_rev=firstrev)
+    except ValueError as e:
+        print("ERROR: %s" % (e.strerror))
+        
+    compressed_results = wkth.compress_results(results, merge_unknown=not ignoreunknown and mergeunknown)
+    if not ignoreunknown:
+        compressed_results = wkth.fill_gaps(compressed_results)
+    compressed_results.sort(key= lambda a: a["start_ind"])
+
+    print("Results for test: %s" % (args.test_name))
+
+    for res in compressed_results:
+        if not ("reported" in res["res"] or detail):
+            continue
+        print_str = ""
+        if res["end_ind"] - res["start_ind"]:
+            print_str += ("[r%i-r%i] (%i)" % (res["start_ind"], res["end_ind"], res["end_ind"] - res["start_ind"])).ljust(30)   
+        else:
+            print_str += ("r%i" % (res["start_ind"])).ljust(30)
+    
+        print_str += res["res"]["actual"]
+        
+        if showexpected and "expected" in res["res"]:
+            print_str += " (Expected: %s)" % (res["res"]["expected"])
+
+        if usecolor:
+            color = get_print_color(res["res"])
+            cprint(print_str, color, end="\n")
+        else:
+            print(print_str)
+
+def main_update(resultsdir, bot):
+    parser = argparse.ArgumentParser(prog="wktesthunter [--config path] update", formatter_class=argparse.RawTextHelpFormatter)
+    cmd_ind = sys.argv.index("update") 
+    args = parser.parse_args(sys.argv[cmd_ind + 1:])
+
+    wkth = wktesthunter.WKTestHunter(resultsdir, bot)
+    wkth.fetch_results()
+    print("DONE!")
+
+def main_get_failing(resultsdir, bot):
+    parser = argparse.ArgumentParser(prog="wktesthunter [--config path] failing", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--nocolor", help="Don't print colors", action="store_true")
+    parser.add_argument("--oneline", help="Print all test with no results in one line"
+                                          "(to pass as argument to run-webkit-tests).", action="store_true")
+    parser.add_argument("-n","--numbuilds", help="Show faling test on the last NUMBUILDS builds.", default=1, type=int)
+    cmd_ind = sys.argv.index("failing") 
+    args = parser.parse_args(sys.argv[cmd_ind + 1:])
+
+    usecolor = not args.nocolor
+    oneline = args.oneline
+    numbuilds = args.numbuilds
+
+    wkth = wktesthunter.WKTestHunter(resultsdir, bot)
+
+    (lastrev, lastbuild) = wkth.get_last_revision()
+    if numbuilds == 1:   
+        print("Test results for r%i - b%i" % (lastrev, lastbuild))
+    else:
+        print("Test results for builds b%i - b%i (%i)" % (lastbuild - numbuilds, lastbuild, numbuilds))
+    
+    failing_tests = list(wkth.get_failing_tests(numbuilds).items())
+    failing_tests.sort(key=lambda a: a[1]["report"]+a[1]["actual"])
+
+    for name,res in failing_tests:
+        if oneline:
+            sys.stdout.write("%s " % (name[1:]))
+            continue
+        print_str = "%s [%s] Expected: %s" % (name[1:], res["actual"], res["expected"])
+        if usecolor:
+            color = get_print_color(res)
+            cprint(print_str, color)
+        else:
+            print(print_str)
+    if oneline: print("")
+    
+
+def get_config(path):
+    import configparser
+    config = configparser.ConfigParser()
+    if config.read(os.path.expanduser(path)) and "results" in config and "resultsdir" in config["results"] and "bot" in config["results"]:
+       return config
+    print("You should set the results directory and the current bot.")
+    
+    resultsdir = input("Results Directory: [~/wk-tools/webkit-testhunter/jsonresults]")
+    if not resultsdir:
+        resultsdir = "~/wk-tools/webkit-testhunter/jsonresults"
+    
+    bot = input("Bot: [GTK Linux 64-bit Release (Tests)] ")
+    if not bot:
+        bot = "GTK Linux 64-bit Release (Tests)"
+
+    config["results"] = {
+        "resultsdir": resultsdir,
+        "bot": bot    
+    }
+    
+    with open(os.path.expanduser(path), "w") as f:
+        config.write(f)
+
+    return config
+
+
+if __name__ == '__main__':
+
+    cmds = {
+        "update": main_update,
+        "failing": main_get_failing,
+        "hunt": main_hunt
+       }
+
+    parser = argparse.ArgumentParser(epilog=extrahelp, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("-config", help="Config file to use", default="~/.wkhunter.cfg")
+    parser.add_argument("cmd", help="Subcommand to run")
+
+    if len(sys.argv) > 1 and sys.argv[1] == "-c":
+        args = parser.parse_args(sys.argv[1:4])
+    else:
+        args = parser.parse_args(sys.argv[1:2])
+
+    config = get_config(args.config)
+
+    resultsdir = os.path.expanduser(config["results"]["resultsdir"])
+    bot = config["results"]["bot"]
+
+    if args.cmd not in cmds:
+        print("Unrecognized command")
+        parser.print_help()
+        sys.exit()
+
+    cmds[args.cmd](resultsdir, bot)
+
+               
